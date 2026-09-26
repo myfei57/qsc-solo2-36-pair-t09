@@ -34,8 +34,8 @@ def recalibrate_ticket(line: LineSupervisor, unit: str = "u1") -> str:
 def prime_for_feed(line: LineSupervisor, unit: str = "u1") -> None:
     """Bring a unit to the point where the feed gate can open."""
     line.lube.prelube(unit)
-    line.lube.establish(unit, 40)
     line.lube.set_tank_level(unit, 80)
+    line.lube.establish(unit, 40)
     line.seal.establish(unit, 30)
     line.compressor.advance(unit, "start")
     line.compressor.persist(unit, "start", 0, 3000)
