@@ -20,6 +20,7 @@ from line_control.store.stream import RecordStream
 
 MIN_PRESSURE = 30
 STOP_SPEED = 300
+TANK_MIN = 20
 
 
 class LubeController:
@@ -36,7 +37,6 @@ class LubeController:
         self._registry = registry
         self._speed_probe = speed_probe
         self._slow_probe = slow_probe
-        self._states: dict[str, str] = {}
 
     def scope(self, unit: str) -> str:
         """Return the parameter scope this module uses for a unit."""
@@ -52,7 +52,7 @@ class LubeController:
             ParameterSpec(scope, "stop_speed", "int", STOP_SPEED, Bounds(0, 1200), "rpm")
         )
         self._registry.declare(
-            ParameterSpec(scope, "tank_min", "int", 20, Bounds(0, 100), "percent")
+            ParameterSpec(scope, "tank_min", "int", TANK_MIN, Bounds(0, 100), "percent")
         )
 
     def _limit(self, unit: str, name: str, fallback: Any) -> Any:
@@ -65,17 +65,30 @@ class LubeController:
     def _state_key(self, unit: str) -> str:
         return scope_key("lube", unit, "state")
 
+    def _pressure_key(self, unit: str) -> str:
+        return scope_key("lube", unit, "pressure")
+
+    def _tank_key(self, unit: str) -> str:
+        return scope_key("lube", unit, "tank")
+
     def minimum(self, unit: str) -> int:
         """Return the minimum acceptable oil pressure."""
-        return MIN_PRESSURE
+        return int(self._limit(unit, "min_pressure", MIN_PRESSURE))
 
     def stop_speed(self, unit: str) -> int:
         """Return the rotor speed below which the oil may stop."""
-        return STOP_SPEED
+        return int(self._limit(unit, "stop_speed", STOP_SPEED))
+
+    def tank_minimum(self, unit: str) -> int:
+        """Return the lowest reservoir level that still allows pressure."""
+        return int(self._limit(unit, "tank_min", TANK_MIN))
 
     def state(self, unit: str) -> str:
         """Return the oil system state label."""
-        return self._states.get(unit, "idle")
+        record = self._stream.visible_view().current(self._state_key(unit))
+        if record is None:
+            return "idle"
+        return str(record.payload.get("state", "idle"))
 
     def established(self, unit: str) -> bool:
         """Report whether oil pressure is established."""
@@ -85,17 +98,30 @@ class LubeController:
         """Report whether the oil supply has been stopped."""
         return self.state(unit) == "stopped"
 
+    def stopped_mark(self, unit: str) -> int:
+        """Return the tick the stop was recorded at, zero while the oil runs."""
+        record = self._stream.visible_view().current(self._state_key(unit))
+        if record is None or record.payload.get("state") != "stopped":
+            return 0
+        return int(record.tick)
+
     def pressure(self, unit: str) -> int:
         """Return the last recorded oil pressure."""
-        return 0
+        record = self._stream.visible_view().current(self._pressure_key(unit))
+        if record is None:
+            return 0
+        return int(record.payload.get("value", 0))
 
     def tank_level(self, unit: str) -> int:
         """Return the reservoir level."""
-        return 0
+        record = self._stream.visible_view().current(self._tank_key(unit))
+        if record is None:
+            return 0
+        return int(record.payload.get("value", 0))
 
     def tank_ok(self, unit: str) -> bool:
         """Report whether the reservoir is above its minimum."""
-        return True
+        return self.tank_level(unit) >= self.tank_minimum(unit)
 
     def oil_temp(self, unit: str) -> int:
         """Return the recorded oil temperature."""
@@ -115,9 +141,11 @@ class LubeController:
             "state": self.state(unit),
             "established": self.established(unit),
             "stopped": self.stopped(unit),
+            "stoppedMark": self.stopped_mark(unit),
             "pressure": self.pressure(unit),
             "minimum": self.minimum(unit),
             "tank": self.tank_level(unit),
+            "tankMin": self.tank_minimum(unit),
             "tankOk": self.tank_ok(unit),
             "oilTemp": self.oil_temp(unit),
             "stopSpeed": self.stop_speed(unit),
@@ -131,7 +159,11 @@ class LubeController:
         return self.status(unit)
 
     def establish(self, unit: str, pressure: int) -> dict[str, Any]:
-        """Establish oil pressure, refusing one below the minimum."""
+        """Establish oil pressure.
+
+        Refuses a pressure below the minimum, and refuses to build pressure
+        at all while a recorded reservoir level sits below its own minimum.
+        """
         minimum = self.minimum(unit)
         if int(pressure) < minimum:
             raise LimitViolationError(
@@ -141,6 +173,18 @@ class LubeController:
                 low=minimum,
                 high=10_000,
             )
+        tank_record = self._stream.visible_view().current(self._tank_key(unit))
+        if tank_record is not None:
+            level = int(tank_record.payload.get("value", 0))
+            low = self.tank_minimum(unit)
+            if level < low:
+                raise LimitViolationError(
+                    f"tank level {level} is below the minimum {low} for unit {unit}",
+                    unit=unit,
+                    value=level,
+                    low=low,
+                    high=100,
+                )
         first = self._stream.append(
             "lube.establish",
             self._state_key(unit),
@@ -148,7 +192,7 @@ class LubeController:
         )
         second = self._stream.append(
             "lube.establish",
-            scope_key("lube", unit, "pressure"),
+            self._pressure_key(unit),
             {"unit": unit, "value": int(pressure)},
         )
         self._stream.commit_upto(max(first.seq, second.seq))
@@ -156,9 +200,17 @@ class LubeController:
 
     def set_tank_level(self, unit: str, level: int) -> dict[str, Any]:
         """Record a reservoir level, refusing one outside 0..100."""
+        if not 0 <= int(level) <= 100:
+            raise LimitViolationError(
+                f"tank level {level} is outside 0..100",
+                unit=unit,
+                value=int(level),
+                low=0,
+                high=100,
+            )
         record = self._stream.append(
             "lube.tank",
-            scope_key("lube", unit, "tank"),
+            self._tank_key(unit),
             {"unit": unit, "value": int(level)},
         )
         self._stream.commit_upto(record.seq)
@@ -176,8 +228,22 @@ class LubeController:
 
     def stop(self, unit: str) -> dict[str, Any]:
         """Stop the oil supply once the rotor has slowed enough."""
+        threshold = self.stop_speed(unit)
+        if not self._slow_probe(unit, threshold):
+            raise OrderingError(
+                f"oil stop refused: rotor at {self.speed(unit)} rpm is still above"
+                f" the stop speed {threshold} for unit {unit}",
+                unit=unit,
+                speed=self.speed(unit),
+                threshold=threshold,
+            )
         self._write_state(unit, "stopped", "lube.stop")
         return self.status(unit)
 
     def _write_state(self, unit: str, state: str, kind: str) -> None:
-        self._states[unit] = state
+        record = self._stream.append(
+            kind,
+            self._state_key(unit),
+            {"unit": unit, "state": state},
+        )
+        self._stream.commit_upto(record.seq)
